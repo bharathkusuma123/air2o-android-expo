@@ -1173,9 +1173,10 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import messaging from "@react-native-firebase/messaging";
 import * as Device from "expo-device";
 import * as Notifications from "expo-notifications";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  AppState,
   Alert,
   BackHandler,
   PermissionsAndroid,
@@ -1201,6 +1202,32 @@ export default function App() {
   const [fcmToken, setFcmToken] = useState(null);
 
   const webViewRef = useRef(null);
+  const audioState = useRef({ version: 1, permission: "pending", foreground: AppState.currentState === "active" });
+  const permissionRequest = useRef(null);
+  const audioScript = useCallback(() => `if (location.origin === 'https://testcustomer.air2o.net') {
+    window.__AIRA_ANDROID_APP__ = true;
+    window.__AIRA_ANDROID_AUDIO__ = ${JSON.stringify(audioState.current)};
+    window.dispatchEvent(new Event('aira-android-audio'));
+  } true;`, []);
+  const publishAudio = useCallback((changes = {}) => {
+    audioState.current = { ...audioState.current, ...changes };
+    webViewRef.current?.injectJavaScript(audioScript());
+  }, [audioScript]);
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", async (state) => {
+      publishAudio({ foreground: state === "active", ...(state === "active" ? { permission: "pending" } : {}) });
+      if (state === "active" && !permissionRequest.current) {
+        try {
+          const granted = await PermissionsAndroid.check(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
+          publishAudio({ permission: granted ? "granted" : "denied", foreground: AppState.currentState === "active" });
+        } catch (error) {
+          publishAudio({ permission: "denied" });
+          console.warn("Unable to check microphone permission", error);
+        }
+      }
+    });
+    return () => subscription.remove();
+  }, [publishAudio]);
   const [, setBackPressCount] = useState(0);
 
   const notificationListener = useRef();
@@ -1282,7 +1309,14 @@ export default function App() {
     const userData = event.nativeEvent.data;
 
     try {
-      console.log("Received message from WebView:", userData);
+      if (event.nativeEvent.url && new URL(event.nativeEvent.url).origin !== "https://testcustomer.air2o.net") return;
+      if (userData) {
+        const command = JSON.parse(userData);
+        if (command?.type === "AIRA_ANDROID_AUDIO_STATE" && command.version === 1) {
+          publishAudio();
+          return;
+        }
+      }
 
       if (userData && userData !== "null") {
         const parsedUserData = JSON.parse(userData);
@@ -1342,7 +1376,7 @@ export default function App() {
 
   // =========================================================
   // REQUEST MICROPHONE PERMISSION (Android)
-  // Never blocks the UI. Resolves to true / false.
+  // Await the real OS decision; the WebView remains usable while pending.
   // =========================================================
   async function requestMicrophonePermissionAsync() {
     if (Platform.OS !== "android") {
@@ -1360,17 +1394,12 @@ export default function App() {
 
       console.log("Requesting microphone permission...");
 
-      const result = await Promise.race([
-        PermissionsAndroid.request(permission, {
-          title: "Microphone Permission",
-          message:
-            "Air2o needs access to your microphone for voice and speech features.",
-          buttonPositive: "Allow",
-          buttonNegative: "Deny",
-        }),
-        // Safety net so this can never hang the startup flow
-        new Promise((resolve) => setTimeout(() => resolve("timeout"), 20000)),
-      ]);
+      const result = await PermissionsAndroid.request(permission, {
+        title: "Microphone Permission",
+        message: "Air2o needs access to your microphone for voice and speech features.",
+        buttonPositive: "Allow",
+        buttonNegative: "Deny",
+      });
 
       console.log("Microphone permission result:", result);
 
@@ -1397,7 +1426,10 @@ export default function App() {
 
     const requestAllPermissions = async () => {
       // Step 1: microphone (wait until the dialog is closed)
-      await requestMicrophonePermissionAsync();
+      permissionRequest.current = requestMicrophonePermissionAsync();
+      const granted = await permissionRequest.current;
+      permissionRequest.current = null;
+      publishAudio({ permission: granted ? "granted" : "denied", foreground: AppState.currentState === "active" });
 
       // Step 2: notifications + FCM token
       const token = await registerForPushNotificationsAsync();
@@ -1432,18 +1464,14 @@ export default function App() {
 
     return () => {
       if (notificationListener.current) {
-        Notifications.removeNotificationSubscription(
-          notificationListener.current
-        );
+        notificationListener.current.remove();
       }
 
       if (responseListener.current) {
-        Notifications.removeNotificationSubscription(
-          responseListener.current
-        );
+        responseListener.current.remove();
       }
     };
-  }, []);
+  }, [publishAudio]);
 
   // =========================================================
   // INJECT FCM TOKEN + USER ID INTO WEBVIEW WHEN THEY CHANGE
@@ -1511,9 +1539,12 @@ export default function App() {
         // Media settings
         mediaPlaybackRequiresUserAction={false}
         allowsInlineMediaPlayback={true}
-        mediaCapturePermissionGrantType="grant"
+        applicationNameForUserAgent="Air2oAndroidAudio/1"
+        injectedJavaScriptObject={{ airaAndroidAudioVersion: 1 }}
+        injectedJavaScriptBeforeContentLoaded={audioScript()}
         // Inject FCM token + user ID
-        injectedJavaScript={`
+        injectedJavaScript={`${audioScript()}
+
           window.fcmToken = ${JSON.stringify(fcmToken || "")};
           window.userId = ${JSON.stringify(String(userId))};
           true;
@@ -1531,6 +1562,7 @@ export default function App() {
         }}
         // Page loaded
         onLoadEnd={() => {
+          publishAudio();
           webViewRef.current?.injectJavaScript(`
             (function() {
               const meta = document.createElement('meta');
